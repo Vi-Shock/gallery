@@ -175,10 +175,13 @@ class LitBudViewModel @Inject constructor(
 
             var transcription = ""
 
+            // LiteRT-LM miniaudio decoder requires a valid WAV file, not raw PCM bytes.
+            val wavBytes = pcmToWav(audioBytes, sampleRate = 16000)
+
             model.runtimeHelper.runInference(
                 model = model,
                 input = transcribePrompt,
-                audioClips = listOf(audioBytes),
+                audioClips = listOf(wavBytes),
                 resultListener = { partial, done, _ ->
                     transcription += partial
                     if (done) {
@@ -336,5 +339,50 @@ class LitBudViewModel @Inject constructor(
         _uiState.update {
             it.copy(phase = LitBudPhase.ERROR, friendlyError = message)
         }
+    }
+
+    /**
+     * Wraps raw PCM-16 mono bytes in a 44-byte WAV/RIFF header.
+     * LiteRT-LM's miniaudio decoder requires a valid WAV file — passing raw PCM
+     * causes "Failed to initialize miniaudio decoder, error code: -10".
+     */
+    private fun pcmToWav(pcm: ByteArray, sampleRate: Int): ByteArray {
+        val channels = 1
+        val bitsPerSample = 16
+        val byteRate = sampleRate * channels * bitsPerSample / 8
+        val dataSize = pcm.size
+        val fileSize = dataSize + 44
+
+        val header = ByteArray(44)
+        header[0] = 'R'.code.toByte(); header[1] = 'I'.code.toByte()
+        header[2] = 'F'.code.toByte(); header[3] = 'F'.code.toByte()
+        header[4] = (fileSize and 0xff).toByte()
+        header[5] = (fileSize shr 8 and 0xff).toByte()
+        header[6] = (fileSize shr 16 and 0xff).toByte()
+        header[7] = (fileSize shr 24 and 0xff).toByte()
+        header[8] = 'W'.code.toByte(); header[9] = 'A'.code.toByte()
+        header[10] = 'V'.code.toByte(); header[11] = 'E'.code.toByte()
+        header[12] = 'f'.code.toByte(); header[13] = 'm'.code.toByte()
+        header[14] = 't'.code.toByte(); header[15] = ' '.code.toByte()
+        header[16] = 16; header[17] = 0; header[18] = 0; header[19] = 0 // fmt chunk size
+        header[20] = 1; header[21] = 0                                   // PCM format
+        header[22] = channels.toByte(); header[23] = 0
+        header[24] = (sampleRate and 0xff).toByte()
+        header[25] = (sampleRate shr 8 and 0xff).toByte()
+        header[26] = (sampleRate shr 16 and 0xff).toByte()
+        header[27] = (sampleRate shr 24 and 0xff).toByte()
+        header[28] = (byteRate and 0xff).toByte()
+        header[29] = (byteRate shr 8 and 0xff).toByte()
+        header[30] = (byteRate shr 16 and 0xff).toByte()
+        header[31] = (byteRate shr 24 and 0xff).toByte()
+        header[32] = (channels * bitsPerSample / 8).toByte(); header[33] = 0 // block align
+        header[34] = bitsPerSample.toByte(); header[35] = 0
+        header[36] = 'd'.code.toByte(); header[37] = 'a'.code.toByte()
+        header[38] = 't'.code.toByte(); header[39] = 'a'.code.toByte()
+        header[40] = (dataSize and 0xff).toByte()
+        header[41] = (dataSize shr 8 and 0xff).toByte()
+        header[42] = (dataSize shr 16 and 0xff).toByte()
+        header[43] = (dataSize shr 24 and 0xff).toByte()
+        return header + pcm
     }
 }

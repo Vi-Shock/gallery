@@ -5,13 +5,17 @@
 
 package com.google.ai.edge.gallery.customtasks.litbud
 
+import android.Manifest
 import android.annotation.SuppressLint
 import android.content.Context
+import android.content.pm.PackageManager
 import android.graphics.Bitmap
 import android.graphics.Paint as NativePaint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import androidx.activity.compose.rememberLauncherForActivityResult
+import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
@@ -72,6 +76,7 @@ import androidx.compose.ui.text.withStyle
 import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
+import androidx.core.content.ContextCompat
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.google.ai.edge.gallery.data.SAMPLE_RATE
 import com.google.ai.edge.gallery.ui.common.LiveCameraView
@@ -304,7 +309,7 @@ private fun ProcessingPanel(message: String) {
 
 // ─── Reading screen with mic button ──────────────────────────────────────────
 
-@SuppressLint("MissingPermission") // RECORD_AUDIO permission declared in manifest
+@SuppressLint("MissingPermission") // Permission is checked at runtime before AudioRecord is created
 @Composable
 private fun ReadingPanel(
     ocrText: String,
@@ -320,6 +325,28 @@ private fun ReadingPanel(
     var secondsLeft by remember { mutableIntStateOf(AUTO_STOP_SECONDS) }
     val audioRecordRef = remember { mutableStateOf<AudioRecord?>(null) }
     val audioStream = remember { ByteArrayOutputStream() }
+
+    // Runtime permission state — false until the OS grants RECORD_AUDIO
+    var micPermissionGranted by remember {
+        mutableStateOf(
+            ContextCompat.checkSelfPermission(
+                context,
+                Manifest.permission.RECORD_AUDIO,
+            ) == PackageManager.PERMISSION_GRANTED
+        )
+    }
+    val permissionLauncher = rememberLauncherForActivityResult(
+        ActivityResultContracts.RequestPermission()
+    ) { granted ->
+        micPermissionGranted = granted
+    }
+
+    // Request mic permission as soon as this screen appears, if not already granted
+    LaunchedEffect(Unit) {
+        if (!micPermissionGranted) {
+            permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+        }
+    }
 
     // Cleanup if composable leaves the tree while recording
     DisposableEffect(Unit) {
@@ -418,6 +445,10 @@ private fun ReadingPanel(
             // Mic / Stop button — 72dp to be very tappable for children
             Button(
                 onClick = {
+                    if (!micPermissionGranted) {
+                        permissionLauncher.launch(Manifest.permission.RECORD_AUDIO)
+                        return@Button
+                    }
                     if (!isRecording) {
                         coroutineScope.launch {
                             isRecording = true
@@ -459,7 +490,11 @@ private fun ReadingPanel(
                 )
                 Spacer(Modifier.size(12.dp))
                 Text(
-                    text = if (isRecording) "Done Reading" else "Read It Aloud!",
+                    text = when {
+                        isRecording -> "Done Reading"
+                        !micPermissionGranted -> "Allow Microphone"
+                        else -> "Read It Aloud!"
+                    },
                     style = MaterialTheme.typography.titleLarge.copy(
                         fontWeight = FontWeight.Bold,
                         fontSize = 22.sp,
@@ -1045,8 +1080,17 @@ private suspend fun recordAudio(
                 break
             }
         }
-        recorder.stop()
-        recorder.release()
+        // Guard: stopAudioRecord() may have already stopped+released this recorder
+        // (user tapped Stop while the IO loop was still running). Calling stop() on
+        // a released AudioRecord throws IllegalStateException — catch it safely.
+        try {
+            if (recorder.recordingState == AudioRecord.RECORDSTATE_RECORDING) {
+                recorder.stop()
+            }
+            recorder.release()
+        } catch (e: IllegalStateException) {
+            android.util.Log.w("LitBud", "AudioRecord stop/release ignored: ${e.message}")
+        }
         audioRecordRef.value = null
     }
 
