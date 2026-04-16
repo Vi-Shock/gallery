@@ -8,10 +8,12 @@ package com.google.ai.edge.gallery.customtasks.litbud
 import android.annotation.SuppressLint
 import android.content.Context
 import android.graphics.Bitmap
+import android.graphics.Paint as NativePaint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
 import androidx.camera.core.CameraSelector
+import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
@@ -28,6 +30,8 @@ import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.outlined.ArrowBack
+import androidx.compose.material.icons.outlined.BarChart
 import androidx.compose.material.icons.outlined.CameraAlt
 import androidx.compose.material.icons.outlined.Mic
 import androidx.compose.material.icons.outlined.MicOff
@@ -53,9 +57,13 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
+import androidx.compose.ui.graphics.nativeCanvas
+import androidx.compose.ui.graphics.toArgb
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.SpanStyle
 import androidx.compose.ui.text.buildAnnotatedString
 import androidx.compose.ui.text.font.FontWeight
@@ -138,8 +146,18 @@ fun LitBudScreen(
                 capturedBitmap = uiState.capturedBitmap,
                 onReadAgain = { viewModel.tryReadingAgain() },
                 onTryAnotherPage = { viewModel.reset() },
+                onMyProgress = { viewModel.showDashboard() },
                 bottomPadding = bottomPadding,
             )
+
+            uiState.phase == LitBudPhase.DASHBOARD -> {
+                val progressEntries by viewModel.progressFlow.collectAsState(initial = emptyList())
+                DashboardPanel(
+                    entries = progressEntries,
+                    onBack = { viewModel.hideDashboard() },
+                    bottomPadding = bottomPadding,
+                )
+            }
 
             uiState.phase == LitBudPhase.ERROR -> ErrorPanel(
                 message = uiState.friendlyError,
@@ -475,6 +493,7 @@ private fun ResultPanel(
     capturedBitmap: Bitmap?,
     onReadAgain: () -> Unit,
     onTryAnotherPage: () -> Unit,
+    onMyProgress: () -> Unit,
     bottomPadding: Dp,
 ) {
     Column(
@@ -640,6 +659,27 @@ private fun ResultPanel(
                     style = MaterialTheme.typography.titleMedium.copy(fontSize = 18.sp),
                 )
             }
+
+            OutlinedButton(
+                onClick = onMyProgress,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(56.dp),
+                shape = RoundedCornerShape(14.dp),
+            ) {
+                Icon(
+                    imageVector = Icons.Outlined.BarChart,
+                    contentDescription = null,
+                    modifier = Modifier.size(22.dp),
+                    tint = LitBudGreen,
+                )
+                Spacer(Modifier.size(8.dp))
+                Text(
+                    text = "My Progress",
+                    style = MaterialTheme.typography.titleMedium.copy(fontSize = 18.sp),
+                    color = LitBudGreen,
+                )
+            }
         }
     }
 }
@@ -698,6 +738,268 @@ private fun ErrorPanel(
                 )
             }
         }
+    }
+}
+
+// ─── Dashboard ────────────────────────────────────────────────────────────────
+
+@Composable
+private fun DashboardPanel(
+    entries: List<ProgressEntity>,
+    onBack: () -> Unit,
+    bottomPadding: Dp,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(bottom = bottomPadding),
+    ) {
+        // Header bar
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(LitBudGreen)
+                .padding(horizontal = 12.dp, vertical = 12.dp),
+        ) {
+            OutlinedButton(
+                onClick = onBack,
+                modifier = Modifier
+                    .align(Alignment.CenterStart)
+                    .height(44.dp),
+                shape = RoundedCornerShape(12.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = Color.White),
+                border = androidx.compose.foundation.BorderStroke(1.5.dp, Color.White.copy(alpha = 0.7f)),
+            ) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Outlined.ArrowBack,
+                    contentDescription = "Back",
+                    modifier = Modifier.size(20.dp),
+                    tint = Color.White,
+                )
+                Spacer(Modifier.size(4.dp))
+                Text(
+                    text = "Back",
+                    style = MaterialTheme.typography.labelLarge.copy(fontSize = 16.sp),
+                    color = Color.White,
+                )
+            }
+            Text(
+                text = "My Progress",
+                style = MaterialTheme.typography.titleLarge.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 22.sp,
+                ),
+                color = Color.White,
+                modifier = Modifier.align(Alignment.Center),
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 20.dp, vertical = 20.dp),
+            verticalArrangement = Arrangement.spacedBy(24.dp),
+        ) {
+            if (entries.isEmpty()) {
+                // Empty state
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(280.dp),
+                    contentAlignment = Alignment.Center,
+                ) {
+                    Column(
+                        horizontalAlignment = Alignment.CenterHorizontally,
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        Icon(
+                            imageVector = Icons.Outlined.BarChart,
+                            contentDescription = null,
+                            modifier = Modifier.size(56.dp),
+                            tint = LitBudGreen.copy(alpha = 0.4f),
+                        )
+                        Text(
+                            text = "Read your first page to see your progress!",
+                            style = MaterialTheme.typography.bodyLarge.copy(fontSize = 18.sp),
+                            textAlign = TextAlign.Center,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                    }
+                }
+            } else {
+                // Chart title
+                Text(
+                    text = "Reading Accuracy Over Time",
+                    style = MaterialTheme.typography.titleMedium.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 18.sp,
+                    ),
+                    color = LitBudGreen,
+                )
+
+                // Canvas line chart
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.4f),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    AccuracyLineChart(
+                        entries = entries,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .height(220.dp)
+                            .padding(16.dp),
+                    )
+                }
+
+                // Summary stats
+                val avgAccuracy = entries.map { it.accuracyPercent }.average().toFloat()
+                val bestAccuracy = entries.maxOf { it.accuracyPercent }
+                val sessionCount = entries.size
+
+                Surface(
+                    shape = RoundedCornerShape(16.dp),
+                    color = LitBudGreenLight,
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(
+                        modifier = Modifier.padding(20.dp),
+                        verticalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
+                        StatRow(label = "Sessions completed", value = "$sessionCount")
+                        StatRow(
+                            label = "Average accuracy",
+                            value = "%.0f%%".format(avgAccuracy),
+                        )
+                        StatRow(
+                            label = "Best accuracy",
+                            value = "%.0f%%".format(bestAccuracy),
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AccuracyLineChart(
+    entries: List<ProgressEntity>,
+    modifier: Modifier = Modifier,
+) {
+    val green = LitBudGreen
+    val gridColor = Color(0xFFCCCCCC)
+    val labelColor = Color(0xFF555555)
+    val density = LocalDensity.current
+
+    Canvas(modifier = modifier) {
+        val w = size.width
+        val h = size.height
+
+        // Left margin for Y-axis labels, bottom margin for X-axis labels
+        val leftMargin = 48.dp.toPx()
+        val bottomMargin = 24.dp.toPx()
+        val chartW = w - leftMargin
+        val chartH = h - bottomMargin
+
+        val gridLinePaint = NativePaint().apply {
+            color = gridColor.toArgb()
+            strokeWidth = 1.dp.toPx()
+            isAntiAlias = true
+        }
+        val labelPaint = NativePaint().apply {
+            color = labelColor.toArgb()
+            textSize = with(density) { 12.sp.toPx() }
+            isAntiAlias = true
+            textAlign = NativePaint.Align.RIGHT
+        }
+        val xLabelPaint = NativePaint().apply {
+            color = labelColor.toArgb()
+            textSize = with(density) { 11.sp.toPx() }
+            isAntiAlias = true
+            textAlign = NativePaint.Align.CENTER
+        }
+
+        // Draw horizontal grid lines at 0, 25, 50, 75, 100%
+        val yLevels = listOf(0f, 25f, 50f, 75f, 100f)
+        for (level in yLevels) {
+            val yPos = chartH - (level / 100f) * chartH
+            drawContext.canvas.nativeCanvas.drawLine(
+                leftMargin, yPos, w, yPos, gridLinePaint,
+            )
+            drawContext.canvas.nativeCanvas.drawText(
+                "${level.toInt()}%",
+                leftMargin - 6.dp.toPx(),
+                yPos + (labelPaint.textSize / 3f),
+                labelPaint,
+            )
+        }
+
+        if (entries.size < 2) {
+            // Single point — just draw the dot
+            val xPos = leftMargin + chartW / 2f
+            val yPos = chartH - (entries[0].accuracyPercent / 100f) * chartH
+            drawCircle(color = green, radius = 6.dp.toPx(), center = Offset(xPos, yPos))
+            drawContext.canvas.nativeCanvas.drawText(
+                "1", xPos, h, xLabelPaint,
+            )
+            return@Canvas
+        }
+
+        // Calculate X positions for each session
+        val xStep = chartW / (entries.size - 1).toFloat()
+        val points = entries.mapIndexed { i, entry ->
+            val x = leftMargin + i * xStep
+            val y = chartH - (entry.accuracyPercent.coerceIn(0f, 100f) / 100f) * chartH
+            Offset(x, y)
+        }
+
+        // Draw lines between points
+        for (i in 0 until points.size - 1) {
+            drawLine(
+                color = green,
+                start = points[i],
+                end = points[i + 1],
+                strokeWidth = 3.dp.toPx(),
+            )
+        }
+
+        // Draw dots and X-axis labels
+        points.forEachIndexed { i, pt ->
+            drawCircle(color = green, radius = 6.dp.toPx(), center = pt)
+            drawCircle(color = Color.White, radius = 3.dp.toPx(), center = pt)
+            // X-axis labels — show every label if ≤10 sessions, else every other
+            if (entries.size <= 10 || i % 2 == 0) {
+                drawContext.canvas.nativeCanvas.drawText(
+                    "${i + 1}", pt.x, h, xLabelPaint,
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun StatRow(label: String, value: String) {
+    androidx.compose.foundation.layout.Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp),
+            color = MaterialTheme.colorScheme.onSurface,
+        )
+        Text(
+            text = value,
+            style = MaterialTheme.typography.titleMedium.copy(
+                fontWeight = FontWeight.Bold,
+                fontSize = 18.sp,
+            ),
+            color = LitBudGreen,
+        )
     }
 }
 

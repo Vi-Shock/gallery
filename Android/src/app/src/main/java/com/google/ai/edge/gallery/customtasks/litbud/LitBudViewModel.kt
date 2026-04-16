@@ -38,7 +38,7 @@ private const val COACHING_PROMPT_TEMPLATE =
     "Coach them warmly. If they did well, celebrate it. If they struggled with words, give " +
     "one specific phonics hint for the hardest word. Keep it to 2-3 sentences."
 
-enum class LitBudPhase { CAPTURE, PROCESSING, READING, COACHING, RESULT, ERROR }
+enum class LitBudPhase { CAPTURE, PROCESSING, READING, COACHING, RESULT, DASHBOARD, ERROR }
 
 data class LitBudUiState(
     val phase: LitBudPhase = LitBudPhase.CAPTURE,
@@ -56,6 +56,11 @@ class LitBudViewModel @Inject constructor(
 
     private val _uiState = MutableStateFlow(LitBudUiState())
     val uiState = _uiState.asStateFlow()
+
+    /** Reactive stream of all reading attempts — drives the Dashboard chart. */
+    val progressFlow by lazy {
+        LitBudDatabase.getInstance(context).progressDao().allEntries()
+    }
 
     /**
      * Executes tool calls found in the raw coaching response.
@@ -256,6 +261,17 @@ class LitBudViewModel @Inject constructor(
     }
 
     // ─── Navigation ───────────────────────────────────────────────────────────
+
+    /** Open the progress dashboard (full-screen overlay). */
+    fun showDashboard() {
+        _uiState.update { it.copy(phase = LitBudPhase.DASHBOARD) }
+    }
+
+    /** Return from dashboard — go back to RESULT if we came from there, else CAPTURE. */
+    fun hideDashboard() {
+        val hasResult = _uiState.value.coachingText.isNotEmpty() || _uiState.value.wordResults.isNotEmpty()
+        _uiState.update { it.copy(phase = if (hasResult) LitBudPhase.RESULT else LitBudPhase.CAPTURE) }
+    }
 
     /** Go back to reading screen (re-use same OCR result). */
     fun tryReadingAgain() {
