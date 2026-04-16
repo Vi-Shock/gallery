@@ -93,6 +93,7 @@ androidx-exifinterface = { group = "androidx.exifinterface", name = "exifinterfa
 moshi-kotlin = { group = "com.squareup.moshi", name = "moshi-kotlin", version.ref = "moshi" }
 moshi-kotlin-codegen = { group = "com.squareup.moshi", name = "moshi-kotlin-codegen", version.ref = "moshi" }
 mlkit-genai-prompt = { group = "com.google.mlkit", name = "genai-prompt", version.ref = "mlkit-genai-prompt" }
+commons-text = { group = "org.apache.commons", name = "commons-text", version = "1.12.0" }
 
 [plugins]
 android-application = { id = "com.android.application", version.ref = "agp" }
