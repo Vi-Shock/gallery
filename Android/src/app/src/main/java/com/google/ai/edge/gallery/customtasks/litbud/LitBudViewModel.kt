@@ -168,15 +168,20 @@ class LitBudViewModel @Inject constructor(
             )
 
             // Step 1: Transcribe the audio — ask model to extract what was spoken.
+            // IMPORTANT: do NOT include the page text here. Including it causes Gemma to echo
+            // the "correct" answer from context instead of transcribing the actual audio,
+            // making every word appear correct even when the child misread.
             val transcribePrompt =
-                "The child read this page aloud. Listen to the audio and write out exactly " +
-                "what they said, word by word. Return only the spoken words, no commentary.\n\n" +
-                "PAGE TEXT:\n$pageText"
+                "Listen carefully to the audio recording. A child is reading aloud. " +
+                "Write out exactly what you hear them say, word by word. " +
+                "Return only the spoken words with no punctuation changes or corrections. " +
+                "Do not add any commentary."
 
             var transcription = ""
 
             // LiteRT-LM miniaudio decoder requires a valid WAV file, not raw PCM bytes.
             val wavBytes = pcmToWav(audioBytes, sampleRate = 16000)
+            Log.d(TAG, "Sending WAV to transcription: ${wavBytes.size} bytes")
 
             model.runtimeHelper.runInference(
                 model = model,
@@ -186,6 +191,8 @@ class LitBudViewModel @Inject constructor(
                     transcription += partial
                     if (done) {
                         val spokenText = transcription.trim()
+                        Log.d(TAG, "Transcription result: '$spokenText'")
+                        Log.d(TAG, "Page text for comparison: '$pageText'")
                         runFuzzyAndCoach(spokenText = spokenText, pageText = pageText, model = model)
                     }
                 },
@@ -209,6 +216,12 @@ class LitBudViewModel @Inject constructor(
             val pageWords = FuzzyMatcher.tokenize(pageText)
             val spokenWords = FuzzyMatcher.tokenize(spokenText)
             val wordResults = FuzzyMatcher.compare(pageWords, spokenWords)
+
+            Log.d(TAG, "FuzzyMatch — pageWords(${pageWords.size}): $pageWords")
+            Log.d(TAG, "FuzzyMatch — spokenWords(${spokenWords.size}): $spokenWords")
+            wordResults.forEach { r ->
+                Log.d(TAG, "  '${r.expected}' vs '${r.spoken}' → score=${r.score} status=${r.status}")
+            }
 
             _uiState.update { it.copy(wordResults = wordResults) }
 

@@ -91,6 +91,7 @@ private val LitBudGreen = Color(0xFF1B8A6B)
 private val LitBudGreenLight = Color(0xFFE8F5F0)
 private val LitBudOrange = Color(0xFFE07B2A)
 private val LitBudRed = Color(0xFFD32F2F)
+private val LitBudGray = Color(0xFF9E9E9E)   // neutral — word not yet reached
 
 /** Auto-stop recording a couple of seconds before the hard 30s limit. */
 private const val AUTO_STOP_SECONDS = 28
@@ -601,11 +602,12 @@ private fun ResultPanel(
                         text = buildAnnotatedString {
                             wordResults.forEachIndexed { i, result ->
                                 val color = when (result.status) {
-                                    WordStatus.CORRECT -> Color.Unspecified
+                                    WordStatus.CORRECT -> LitBudGreen
                                     WordStatus.STRUGGLING -> LitBudOrange
                                     WordStatus.MISSED -> LitBudRed
+                                    WordStatus.NOT_REACHED -> LitBudGray
                                 }
-                                val bold = result.status != WordStatus.CORRECT
+                                val bold = result.status == WordStatus.STRUGGLING || result.status == WordStatus.MISSED
                                 withStyle(
                                     SpanStyle(
                                         color = color,
@@ -627,9 +629,10 @@ private fun ResultPanel(
 
                 // Legend
                 Column(verticalArrangement = Arrangement.spacedBy(4.dp)) {
-                    LegendItem(color = Color.Unspecified, label = "Read correctly")
+                    LegendItem(color = LitBudGreen, label = "Read correctly")
                     LegendItem(color = LitBudOrange, label = "A little tricky")
                     LegendItem(color = LitBudRed, label = "Needs more practice")
+                    LegendItem(color = LitBudGray, label = "Not reached yet")
                 }
             } else if (ocrText.isNotEmpty()) {
                 // Fallback if no audio was processed yet
@@ -721,11 +724,10 @@ private fun ResultPanel(
 
 @Composable
 private fun LegendItem(color: Color, label: String) {
-    val textColor = if (color == Color.Unspecified) LitBudGreen else color
     Text(
         text = "● $label",
         style = MaterialTheme.typography.bodyMedium.copy(fontSize = 16.sp),
-        color = textColor,
+        color = color,
     )
 }
 
