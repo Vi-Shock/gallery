@@ -5,13 +5,17 @@
 
 package com.google.ai.edge.gallery.customtasks.litbud
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.util.Log
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.runtime.runtimeHelper
+import com.google.ai.edge.litertlm.Content
+import com.google.ai.edge.litertlm.Contents
 import dagger.hilt.android.lifecycle.HiltViewModel
+import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
@@ -46,10 +50,27 @@ data class LitBudUiState(
 )
 
 @HiltViewModel
-class LitBudViewModel @Inject constructor() : ViewModel() {
+class LitBudViewModel @Inject constructor(
+    @ApplicationContext private val context: Context,
+) : ViewModel() {
 
     private val _uiState = MutableStateFlow(LitBudUiState())
     val uiState = _uiState.asStateFlow()
+
+    /**
+     * System prompt loaded from assets once and reused for every coaching call.
+     * OCR and transcription calls do NOT use this — they have their own simple prompts.
+     */
+    private val coachingSystemInstruction: Contents? by lazy {
+        try {
+            val text = context.assets.open("prompts/tutor_system.txt")
+                .bufferedReader().use { it.readText() }
+            if (text.isNotEmpty()) Contents.of(Content.Text(text)) else null
+        } catch (e: Exception) {
+            Log.w(TAG, "Could not load tutor_system.txt: ${e.message}")
+            null
+        }
+    }
 
     // ─── Feature 1: Page Capture & OCR ───────────────────────────────────────
 
@@ -192,6 +213,7 @@ class LitBudViewModel @Inject constructor() : ViewModel() {
                 model = model,
                 supportImage = false,
                 supportAudio = false,
+                systemInstruction = coachingSystemInstruction,
             )
 
             var coachingResponse = ""
@@ -202,10 +224,11 @@ class LitBudViewModel @Inject constructor() : ViewModel() {
                 resultListener = { partial, done, _ ->
                     coachingResponse += partial
                     if (done) {
+                        val coachingText = parseCoachingResponse(coachingResponse)
                         _uiState.update {
                             it.copy(
                                 phase = LitBudPhase.RESULT,
-                                coachingText = coachingResponse.trim(),
+                                coachingText = coachingText,
                             )
                         }
                     }
@@ -243,6 +266,38 @@ class LitBudViewModel @Inject constructor() : ViewModel() {
     }
 
     // ─── Helpers ──────────────────────────────────────────────────────────────
+
+    /**
+     * Strips non-display content from the raw model response before showing it to the child:
+     *   1. Thinking blocks: <think>...</think>
+     *   2. Tool call blocks: ```json { "tool_calls": [...] } ```
+     *   3. Bare JSON objects that contain a "tool_calls" key (fallback if no fences)
+     */
+    private fun parseCoachingResponse(raw: String): String {
+        var text = raw
+        // Remove <think>...</think> blocks (Gemma thinking mode traces)
+        text = text.replace(
+            Regex("<think>[\\s\\S]*?</think>", setOf(RegexOption.IGNORE_CASE)),
+            "",
+        )
+        // Remove ```json ... ``` fenced tool call blocks
+        text = text.replace(Regex("```json[\\s\\S]*?```"), "")
+        // Remove any remaining bare { "tool_calls": ... } JSON (no fences)
+        val toolCallMarkers = listOf(
+            "{\"tool_calls\"",
+            "{ \"tool_calls\"",
+            "{\n  \"tool_calls\"",
+            "{\n\"tool_calls\"",
+        )
+        for (marker in toolCallMarkers) {
+            val idx = text.indexOf(marker)
+            if (idx >= 0) {
+                text = text.substring(0, idx)
+                break
+            }
+        }
+        return text.trim()
+    }
 
     private suspend fun waitForModel(model: Model): Boolean {
         var waited = 0
