@@ -58,6 +58,12 @@ class LitBudViewModel @Inject constructor(
     val uiState = _uiState.asStateFlow()
 
     /**
+     * Executes tool calls found in the raw coaching response.
+     * Writes to Room DB and SharedPreferences; never crashes on malformed JSON.
+     */
+    private val toolCallHandler by lazy { ToolCallHandler(context) }
+
+    /**
      * System prompt loaded from assets once and reused for every coaching call.
      * OCR and transcription calls do NOT use this — they have their own simple prompts.
      */
@@ -224,6 +230,8 @@ class LitBudViewModel @Inject constructor(
                 resultListener = { partial, done, _ ->
                     coachingResponse += partial
                     if (done) {
+                        // Execute tool calls (DB writes, SharedPrefs) before stripping JSON
+                        toolCallHandler.handle(coachingResponse, viewModelScope)
                         val coachingText = parseCoachingResponse(coachingResponse)
                         _uiState.update {
                             it.copy(
