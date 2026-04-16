@@ -1,6 +1,28 @@
 {
   "models": [
     {
+      "name": "Gemma-4-E2B-it",
+      "modelId": "litert-community/gemma-4-E2B-it-litert-lm",
+      "modelFile": "gemma-4-E2B-it.litertlm",
+      "description": "Gemma 4 E2B on-device model for LitBud. Supports vision (book page OCR), audio (reading aloud), and thinking mode. Requires 8GB+ device RAM.",
+      "sizeInBytes": 2583085056,
+      "minDeviceMemoryInGb": 8,
+      "commitHash": "7fa1d78473894f7e736a21d920c3aa80f950c0db",
+      "llmSupportImage": true,
+      "llmSupportAudio": true,
+      "llmSupportThinking": true,
+      "defaultConfig": {
+        "topK": 64,
+        "topP": 0.95,
+        "temperature": 1.0,
+        "maxContextLength": 32000,
+        "maxTokens": 4000,
+        "accelerators": "gpu,cpu",
+        "visionAccelerator": "gpu"
+      },
+      "taskTypes": ["llm_chat", "llm_ask_image", "llm_ask_audio"]
+    },
+    {
       "name": "Gemma-3n-E2B-it-int4",
       "modelId": "google/gemma-3n-E2B-it-litert-preview",
       "modelFile": "gemma-3n-E2B-it-int4.task",
