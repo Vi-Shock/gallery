@@ -14,9 +14,13 @@ import android.graphics.Paint as NativePaint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.speech.tts.TextToSpeech
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.camera.core.CameraSelector
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
 import androidx.compose.foundation.Canvas
 import androidx.compose.foundation.Image
 import androidx.compose.foundation.background
@@ -61,6 +65,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.asImageBitmap
@@ -89,6 +94,9 @@ import kotlinx.coroutines.launch
 // LitBud brand green — readable, child-friendly
 private val LitBudGreen = Color(0xFF1B8A6B)
 private val LitBudGreenLight = Color(0xFFE8F5F0)
+// Dark text for use on LitBudGreenLight surfaces — onSurface is light in dark mode,
+// making text invisible on the always-light LitBudGreenLight background.
+private val LitBudGreenLightText = Color(0xFF1A3D2B)
 private val LitBudOrange = Color(0xFFE07B2A)
 private val LitBudRed = Color(0xFFD32F2F)
 private val LitBudGray = Color(0xFF9E9E9E)   // neutral — word not yet reached
@@ -114,8 +122,30 @@ fun LitBudScreen(
 
     var latestBitmap by remember { mutableStateOf<Bitmap?>(null) }
 
-    Box(modifier = Modifier.fillMaxSize()) {
+    // Solid background on the outer box prevents the Android window background (black)
+    // from showing through during the single-frame gap between phase transitions.
+    Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
         when {
+            // PROCESSING and COACHING are checked BEFORE !modelReady so the spinner
+            // stays on screen even if ModelManagerViewModel briefly changes state during
+            // inference (which would otherwise flip the screen to ModelLoadingPanel).
+            uiState.phase == LitBudPhase.PROCESSING -> ProcessingPanel(
+                message = "Reading your book page..."
+            )
+
+            uiState.phase == LitBudPhase.COACHING -> ProcessingPanel(
+                message = "Listening and thinking of some tips for you..."
+            )
+
+            // WORD_DRILL checked before !modelReady so the drill screen stays
+            // visible even if ModelManagerViewModel briefly changes state.
+            uiState.phase == LitBudPhase.WORD_DRILL -> WordDrillScreen(
+                uiState = uiState,
+                model = model,
+                viewModel = viewModel,
+                bottomPadding = bottomPadding,
+            )
+
             !modelReady -> ModelLoadingPanel()
 
             uiState.phase == LitBudPhase.CAPTURE -> CapturePanel(
@@ -125,10 +155,6 @@ fun LitBudScreen(
                     if (bmp != null) viewModel.captureAndOcr(bmp, model)
                 },
                 bottomPadding = bottomPadding,
-            )
-
-            uiState.phase == LitBudPhase.PROCESSING -> ProcessingPanel(
-                message = "Reading your book page..."
             )
 
             uiState.phase == LitBudPhase.READING -> ReadingPanel(
@@ -141,16 +167,15 @@ fun LitBudScreen(
                 bottomPadding = bottomPadding,
             )
 
-            uiState.phase == LitBudPhase.COACHING -> ProcessingPanel(
-                message = "Listening and thinking of some tips for you..."
-            )
-
             uiState.phase == LitBudPhase.RESULT -> ResultPanel(
                 ocrText = uiState.ocrText,
                 wordResults = uiState.wordResults,
                 coachingText = uiState.coachingText,
                 capturedBitmap = uiState.capturedBitmap,
                 onReadAgain = { viewModel.tryReadingAgain() },
+                onPracticeWords = if (FuzzyMatcher.needsHelp(uiState.wordResults).isNotEmpty()) {
+                    { viewModel.startDrill(model) }
+                } else null,
                 onTryAnotherPage = { viewModel.reset() },
                 onMyProgress = { viewModel.showDashboard() },
                 bottomPadding = bottomPadding,
@@ -286,7 +311,9 @@ private fun CapturePanel(
 private fun ProcessingPanel(message: String) {
     Box(
         contentAlignment = Alignment.Center,
-        modifier = Modifier.fillMaxSize(),
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background),
     ) {
         Column(
             horizontalAlignment = Alignment.CenterHorizontally,
@@ -411,7 +438,7 @@ private fun ReadingPanel(
                         fontSize = 20.sp,
                         lineHeight = 30.sp,
                     ),
-                    color = MaterialTheme.colorScheme.onSurface,
+                    color = LitBudGreenLightText,
                     modifier = Modifier.padding(16.dp),
                 )
             }
@@ -528,6 +555,7 @@ private fun ResultPanel(
     coachingText: String,
     capturedBitmap: Bitmap?,
     onReadAgain: () -> Unit,
+    onPracticeWords: (() -> Unit)?,
     onTryAnotherPage: () -> Unit,
     onMyProgress: () -> Unit,
     bottomPadding: Dp,
@@ -577,7 +605,7 @@ private fun ResultPanel(
                             fontSize = 20.sp,
                             lineHeight = 30.sp,
                         ),
-                        color = MaterialTheme.colorScheme.onSurface,
+                        color = LitBudGreenLightText,
                         modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
                     )
                 }
@@ -654,6 +682,7 @@ private fun ResultPanel(
                             fontSize = 20.sp,
                             lineHeight = 30.sp,
                         ),
+                        color = LitBudGreenLightText,
                         modifier = Modifier.padding(16.dp),
                     )
                 }
@@ -683,6 +712,25 @@ private fun ResultPanel(
                         fontSize = 20.sp,
                     ),
                 )
+            }
+
+            if (onPracticeWords != null) {
+                Button(
+                    onClick = onPracticeWords,
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(60.dp),
+                    shape = RoundedCornerShape(14.dp),
+                    colors = ButtonDefaults.buttonColors(containerColor = LitBudOrange),
+                ) {
+                    Text(
+                        text = "Practice Missed Words",
+                        style = MaterialTheme.typography.titleMedium.copy(
+                            fontWeight = FontWeight.Bold,
+                            fontSize = 20.sp,
+                        ),
+                    )
+                }
             }
 
             OutlinedButton(
@@ -718,6 +766,542 @@ private fun ResultPanel(
                     color = LitBudGreen,
                 )
             }
+        }
+    }
+}
+
+// ─── Word Drill ───────────────────────────────────────────────────────────────
+
+@SuppressLint("MissingPermission")
+@Composable
+private fun WordDrillScreen(
+    uiState: LitBudUiState,
+    model: com.google.ai.edge.gallery.data.Model,
+    viewModel: LitBudViewModel,
+    bottomPadding: Dp,
+) {
+    val context = LocalContext.current
+    val coroutineScope = rememberCoroutineScope()
+
+    var isRecording by remember { mutableStateOf(false) }
+    var secondsLeft by remember { mutableIntStateOf(5) }
+    val audioRecordRef = remember { mutableStateOf<AudioRecord?>(null) }
+    val audioStream = remember { ByteArrayOutputStream() }
+
+    // TTS — built-in Android offline speech synthesis so the child can hear the word
+    val tts = remember { mutableStateOf<TextToSpeech?>(null) }
+    DisposableEffect(Unit) {
+        val t = TextToSpeech(context) { /* init status ignored — speak() is a no-op if not ready */ }
+        tts.value = t
+        onDispose {
+            t.stop()
+            t.shutdown()
+            tts.value = null
+        }
+    }
+
+    DisposableEffect(Unit) {
+        onDispose {
+            audioRecordRef.value?.release()
+            audioRecordRef.value = null
+        }
+    }
+
+    // Countdown timer for the 5-second drill recording window
+    LaunchedEffect(isRecording) {
+        if (isRecording) {
+            secondsLeft = 5
+            while (isRecording && secondsLeft > 0) {
+                delay(1_000)
+                secondsLeft--
+            }
+        }
+    }
+
+    val currentWord = uiState.drillWords.getOrNull(uiState.drillIndex) ?: ""
+    val totalWords = uiState.drillWords.size
+    val isLastWord = uiState.drillIndex >= totalWords - 1
+
+    // Auto-speak the word whenever a new drill word appears (SHOWING_WORD state)
+    LaunchedEffect(currentWord, uiState.drillState) {
+        if (uiState.drillState == DrillState.SHOWING_WORD && currentWord.isNotEmpty()) {
+            delay(500) // brief pause so the screen renders before speaking
+            tts.value?.speak(currentWord, TextToSpeech.QUEUE_FLUSH, null, "drill_word")
+        }
+    }
+
+    Box(modifier = Modifier.fillMaxSize().background(MaterialTheme.colorScheme.background)) {
+        when (uiState.drillState) {
+            DrillState.FETCHING_TIP -> ProcessingPanel("Getting your practice tip...")
+            DrillState.EVALUATING -> ProcessingPanel("Checking... one moment!")
+
+            DrillState.SHOWING_WORD -> DrillWordPanel(
+                word = currentWord,
+                wordIndex = uiState.drillIndex,
+                totalWords = totalWords,
+                tip = uiState.drillTip,
+                triesLeft = uiState.drillTriesLeft,
+                isRecording = isRecording,
+                secondsLeft = secondsLeft,
+                onHearWord = {
+                    tts.value?.speak(currentWord, TextToSpeech.QUEUE_FLUSH, null, "drill_word")
+                },
+                onMicTap = {
+                    if (!isRecording) {
+                        coroutineScope.launch {
+                            isRecording = true
+                            val bytes = recordAudio(
+                                context = context,
+                                audioRecordRef = audioRecordRef,
+                                audioStream = audioStream,
+                                autoStopSeconds = 5,
+                                isRecordingCheck = { isRecording },
+                                onAutoStop = { isRecording = false },
+                            )
+                            isRecording = false
+                            if (bytes.isNotEmpty()) {
+                                viewModel.recordAndEvaluateDrillWord(bytes, model)
+                            }
+                        }
+                    } else {
+                        // Child tapped to stop early
+                        isRecording = false
+                        val bytes = stopAudioRecord(
+                            audioRecordRef = audioRecordRef,
+                            audioStream = audioStream,
+                        )
+                        if (bytes.isNotEmpty()) {
+                            viewModel.recordAndEvaluateDrillWord(bytes, model)
+                        }
+                    }
+                },
+                bottomPadding = bottomPadding,
+            )
+
+            DrillState.WORD_CORRECT -> DrillCelebrationPanel(
+                word = currentWord,
+                sentence = uiState.drillSentence,
+                isLastWord = isLastWord,
+                onNext = { viewModel.advanceDrill(model) },
+                onFinish = { viewModel.finishDrill() },
+                bottomPadding = bottomPadding,
+            )
+
+            DrillState.WORD_FAILED -> DrillEncouragementPanel(
+                word = currentWord,
+                isLastWord = isLastWord,
+                onNext = { viewModel.advanceDrill(model) },
+                onFinish = { viewModel.finishDrill() },
+                bottomPadding = bottomPadding,
+            )
+
+            DrillState.COMPLETE -> DrillCompletePanel(
+                wordCount = totalWords,
+                onFinish = { viewModel.finishDrill() },
+                bottomPadding = bottomPadding,
+            )
+        }
+    }
+}
+
+@Composable
+private fun DrillWordPanel(
+    word: String,
+    wordIndex: Int,
+    totalWords: Int,
+    tip: String,
+    triesLeft: Int,
+    isRecording: Boolean,
+    secondsLeft: Int,
+    onHearWord: () -> Unit,
+    onMicTap: () -> Unit,
+    bottomPadding: Dp,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(bottom = bottomPadding),
+        horizontalAlignment = Alignment.CenterHorizontally,
+    ) {
+        // Progress header
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(LitBudGreen)
+                .padding(horizontal = 20.dp, vertical = 14.dp),
+        ) {
+            Text(
+                text = "Word ${wordIndex + 1} of $totalWords",
+                style = MaterialTheme.typography.titleMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 18.sp,
+                ),
+                color = Color.White,
+                modifier = Modifier.align(Alignment.Center),
+            )
+        }
+
+        Column(
+            modifier = Modifier
+                .weight(1f)
+                .verticalScroll(rememberScrollState())
+                .padding(horizontal = 24.dp, vertical = 24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(20.dp),
+        ) {
+            // Large word display
+            Surface(
+                color = LitBudGreenLight,
+                shape = RoundedCornerShape(20.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = word.uppercase(),
+                    style = MaterialTheme.typography.displaySmall.copy(
+                        fontWeight = FontWeight.ExtraBold,
+                        fontSize = 52.sp,
+                        letterSpacing = 6.sp,
+                    ),
+                    color = LitBudGreen,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(vertical = 24.dp, horizontal = 16.dp),
+                )
+            }
+
+            // "Hear it again" button — child can tap to hear the word spoken aloud again
+            OutlinedButton(
+                onClick = onHearWord,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(52.dp),
+                shape = RoundedCornerShape(14.dp),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = LitBudGreen),
+                border = androidx.compose.foundation.BorderStroke(1.5.dp, LitBudGreen.copy(alpha = 0.6f)),
+            ) {
+                Text(
+                    text = "🔊  Hear it again",
+                    style = MaterialTheme.typography.titleMedium.copy(fontSize = 18.sp),
+                )
+            }
+
+            // Phonics tip speech bubble
+            if (tip.isNotEmpty()) {
+                Surface(
+                    color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Column(modifier = Modifier.padding(16.dp)) {
+                        Text(
+                            text = "LitBud tip:",
+                            style = MaterialTheme.typography.labelLarge.copy(fontSize = 15.sp),
+                            color = LitBudGreen,
+                            fontWeight = FontWeight.Bold,
+                        )
+                        Spacer(Modifier.height(4.dp))
+                        Text(
+                            text = tip,
+                            style = MaterialTheme.typography.bodyLarge.copy(
+                                fontSize = 18.sp,
+                                lineHeight = 26.sp,
+                            ),
+                            color = MaterialTheme.colorScheme.onSurface,
+                        )
+                    }
+                }
+            }
+
+            // Try counter — filled ★ for remaining, ☆ for used
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text(
+                    text = buildString {
+                        repeat(triesLeft) { append("★ ") }
+                        repeat(3 - triesLeft) { append("☆ ") }
+                    }.trimEnd(),
+                    style = MaterialTheme.typography.headlineMedium.copy(fontSize = 30.sp),
+                    color = LitBudOrange,
+                )
+                Text(
+                    text = if (triesLeft == 3) "3 tries" else if (triesLeft == 1) "Last try!" else "$triesLeft tries left",
+                    style = MaterialTheme.typography.bodyMedium.copy(fontSize = 15.sp),
+                    color = if (triesLeft == 1) LitBudRed else MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+            }
+        }
+
+        // Mic button area
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .background(MaterialTheme.colorScheme.surface)
+                .padding(horizontal = 24.dp, vertical = 16.dp),
+            horizontalAlignment = Alignment.CenterHorizontally,
+            verticalArrangement = Arrangement.spacedBy(8.dp),
+        ) {
+            if (isRecording) {
+                Text(
+                    text = "Listening... $secondsLeft s",
+                    style = MaterialTheme.typography.bodyLarge.copy(
+                        fontWeight = FontWeight.SemiBold,
+                        fontSize = 18.sp,
+                    ),
+                    color = LitBudRed,
+                )
+            } else {
+                Text(
+                    text = "Tap the button and say the word!",
+                    style = MaterialTheme.typography.bodyLarge.copy(fontSize = 17.sp),
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    textAlign = TextAlign.Center,
+                )
+            }
+
+            Button(
+                onClick = onMicTap,
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .height(64.dp),
+                shape = RoundedCornerShape(16.dp),
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = if (isRecording) LitBudRed else LitBudGreen,
+                ),
+            ) {
+                Icon(
+                    imageVector = if (isRecording) Icons.Outlined.MicOff else Icons.Outlined.Mic,
+                    contentDescription = null,
+                    modifier = Modifier.size(28.dp),
+                )
+                Spacer(Modifier.size(10.dp))
+                Text(
+                    text = if (isRecording) "Done!" else "Say it!",
+                    style = MaterialTheme.typography.titleLarge.copy(
+                        fontWeight = FontWeight.Bold,
+                        fontSize = 22.sp,
+                    ),
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun DrillCelebrationPanel(
+    word: String,
+    sentence: String,
+    isLastWord: Boolean,
+    onNext: () -> Unit,
+    onFinish: () -> Unit,
+    bottomPadding: Dp,
+) {
+    // Scale-in bounce animation when the celebration panel appears
+    var triggered by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { triggered = true }
+    val starScale by animateFloatAsState(
+        targetValue = if (triggered) 1f else 0f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMedium,
+        ),
+        label = "starScale",
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(start = 28.dp, end = 28.dp, bottom = bottomPadding),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = "⭐",
+            fontSize = 80.sp,
+            modifier = Modifier.scale(starScale),
+        )
+        Spacer(Modifier.height(12.dp))
+        Text(
+            text = "You said it!",
+            style = MaterialTheme.typography.headlineSmall.copy(
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 32.sp,
+            ),
+            color = LitBudGreen,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = word.uppercase(),
+            style = MaterialTheme.typography.titleLarge.copy(
+                fontWeight = FontWeight.Bold,
+                fontSize = 28.sp,
+                letterSpacing = 4.sp,
+            ),
+            color = LitBudGreen,
+        )
+
+        if (sentence.isNotEmpty()) {
+            Spacer(Modifier.height(20.dp))
+            Surface(
+                color = LitBudGreenLight,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth(),
+            ) {
+                Text(
+                    text = sentence,
+                    style = MaterialTheme.typography.bodyLarge.copy(
+                        fontSize = 20.sp,
+                        lineHeight = 28.sp,
+                    ),
+                    color = LitBudGreenLightText,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 16.dp),
+                )
+            }
+        }
+
+        Spacer(Modifier.height(32.dp))
+        Button(
+            onClick = if (isLastWord) onFinish else onNext,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(60.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = LitBudGreen),
+        ) {
+            Text(
+                text = if (isLastWord) "All Done!" else "Next Word →",
+                style = MaterialTheme.typography.titleMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 20.sp,
+                ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun DrillEncouragementPanel(
+    word: String,
+    isLastWord: Boolean,
+    onNext: () -> Unit,
+    onFinish: () -> Unit,
+    bottomPadding: Dp,
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(start = 28.dp, end = 28.dp, bottom = bottomPadding),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = "💪",
+            fontSize = 64.sp,
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = "That's tricky!",
+            style = MaterialTheme.typography.headlineSmall.copy(
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 28.sp,
+            ),
+            color = LitBudOrange,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "Keep practising \"${word}\" — you'll get it!",
+            style = MaterialTheme.typography.bodyLarge.copy(
+                fontSize = 18.sp,
+                lineHeight = 26.sp,
+            ),
+            color = MaterialTheme.colorScheme.onSurface,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(32.dp))
+        Button(
+            onClick = if (isLastWord) onFinish else onNext,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(60.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = LitBudOrange),
+        ) {
+            Text(
+                text = if (isLastWord) "All Done!" else "Next Word →",
+                style = MaterialTheme.typography.titleMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 20.sp,
+                ),
+            )
+        }
+    }
+}
+
+@Composable
+private fun DrillCompletePanel(
+    wordCount: Int,
+    onFinish: () -> Unit,
+    bottomPadding: Dp,
+) {
+    var triggered by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { triggered = true }
+    val scale by animateFloatAsState(
+        targetValue = if (triggered) 1f else 0f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMediumLow,
+        ),
+        label = "completeScale",
+    )
+
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(start = 28.dp, end = 28.dp, bottom = bottomPadding),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+    ) {
+        Text(
+            text = "🎉",
+            fontSize = 80.sp,
+            modifier = Modifier.scale(scale),
+        )
+        Spacer(Modifier.height(16.dp))
+        Text(
+            text = "Amazing practice!",
+            style = MaterialTheme.typography.headlineSmall.copy(
+                fontWeight = FontWeight.ExtraBold,
+                fontSize = 30.sp,
+            ),
+            color = LitBudGreen,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = "You worked on $wordCount ${if (wordCount == 1) "word" else "words"} today. Great job!",
+            style = MaterialTheme.typography.bodyLarge.copy(
+                fontSize = 20.sp,
+                lineHeight = 28.sp,
+            ),
+            color = MaterialTheme.colorScheme.onSurface,
+            textAlign = TextAlign.Center,
+        )
+        Spacer(Modifier.height(32.dp))
+        Button(
+            onClick = onFinish,
+            modifier = Modifier
+                .fillMaxWidth()
+                .height(60.dp),
+            shape = RoundedCornerShape(14.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = LitBudGreen),
+        ) {
+            Text(
+                text = "Read Another Page",
+                style = MaterialTheme.typography.titleMedium.copy(
+                    fontWeight = FontWeight.Bold,
+                    fontSize = 20.sp,
+                ),
+            )
         }
     }
 }
@@ -1067,6 +1651,17 @@ private suspend fun recordAudio(
         minBufferSize,
     )
     audioRecordRef.value = recorder
+
+    // Guard: AudioRecord constructor can return STATE_UNINITIALIZED if the mic
+    // hardware is still being released from a previous session (e.g. "Read Again"
+    // tapped quickly). Calling startRecording() in that state throws
+    // IllegalStateException and crashes the app.
+    if (recorder.state != AudioRecord.STATE_INITIALIZED) {
+        android.util.Log.e("LitBud", "AudioRecord failed to initialize — mic may still be busy")
+        recorder.release()
+        audioRecordRef.value = null
+        return ByteArray(0)
+    }
 
     val buffer = ByteArray(minBufferSize)
     val maxMs = autoStopSeconds * 1000L

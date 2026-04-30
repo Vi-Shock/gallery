@@ -42,7 +42,19 @@ class LitBudTask @Inject constructor() : CustomTask {
         icon = Icons.AutoMirrored.Outlined.MenuBook,
         description = "Point the camera at a book page, read aloud, and get warm coaching — 100% offline. For children ages 5–12.",
         shortDescription = "Offline AI reading tutor",
-        models = mutableListOf(),
+        // Deduplicating list — ModelManagerViewModel.loadModelAllowlist() can run multiple
+        // times (e.g. allowlist refreshes). The task object is a Hilt singleton, so its
+        // models list accumulates duplicates on each run. This list guards against that.
+        models = object : AbstractMutableList<Model>() {
+            private val delegate = mutableListOf<Model>()
+            override val size get() = delegate.size
+            override fun get(index: Int) = delegate[index]
+            override fun add(index: Int, element: Model) {
+                if (delegate.none { it.name == element.name }) delegate.add(index, element)
+            }
+            override fun removeAt(index: Int) = delegate.removeAt(index)
+            override fun set(index: Int, element: Model) = delegate.set(index, element)
+        },
         modelNames = listOf("Gemma-4-E2B-it"),
     )
 

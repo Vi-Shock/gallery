@@ -12,8 +12,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.google.ai.edge.gallery.data.Model
 import com.google.ai.edge.gallery.runtime.runtimeHelper
-import com.google.ai.edge.litertlm.Content
-import com.google.ai.edge.litertlm.Contents
+
 import dagger.hilt.android.lifecycle.HiltViewModel
 import dagger.hilt.android.qualifiers.ApplicationContext
 import javax.inject.Inject
@@ -23,6 +22,7 @@ import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import org.json.JSONArray
 
 private const val TAG = "LitBudViewModel"
 
@@ -31,14 +31,31 @@ private const val OCR_PROMPT =
 
 /**
  * Coaching prompt sent after fuzzy matching.
- * PAGE_TEXT and WORD_ANALYSIS are substituted at runtime.
+ * PAGE_TEXT and STRUGGLED_WORDS are substituted at runtime.
+ *
+ * Key constraint: the model must only coach on words from STRUGGLED WORDS.
+ * Without this explicit rule the model reads PAGE TEXT, picks the most complex-
+ * looking word on the page (e.g. "transport"), and coaches on it — even when
+ * the child actually read that word correctly.
  */
 private const val COACHING_PROMPT_TEMPLATE =
-    "PAGE TEXT:\n%s\n\nWORD ANALYSIS:\n%s\n\nThe child just finished reading this page aloud. " +
-    "Coach them warmly. If they did well, celebrate it. If they struggled with words, give " +
-    "one specific phonics hint for the hardest word. Keep it to 2-3 sentences."
+    "PAGE TEXT:\n%s\n\n" +
+    "STRUGGLED WORDS — the ONLY words that need coaching (empty means child read everything correctly):\n%s\n\n" +
+    "The child just finished reading this page aloud. Coach them warmly in 2–3 sentences.\n" +
+    "RULE: If STRUGGLED WORDS lists any words, your phonics hint MUST be for one of those words. " +
+    "Never give a hint for a word from PAGE TEXT that is not in STRUGGLED WORDS — those were read correctly."
 
-enum class LitBudPhase { CAPTURE, PROCESSING, READING, COACHING, RESULT, DASHBOARD, ERROR }
+enum class LitBudPhase { CAPTURE, PROCESSING, READING, COACHING, RESULT, DASHBOARD, WORD_DRILL, ERROR }
+
+/** Sub-state used while the child is in the word-by-word practice drill. */
+enum class DrillState {
+    FETCHING_TIP,  // model generating phonics tip + example sentence
+    SHOWING_WORD,  // word + tip on screen, waiting for mic tap
+    EVALUATING,    // model checking recorded audio against target word
+    WORD_CORRECT,  // child got it — celebrate
+    WORD_FAILED,   // used all tries — show encouragement
+    COMPLETE,      // all words drilled
+}
 
 data class LitBudUiState(
     val phase: LitBudPhase = LitBudPhase.CAPTURE,
@@ -47,6 +64,13 @@ data class LitBudUiState(
     val wordResults: List<WordResult> = emptyList(),
     val coachingText: String = "",
     val friendlyError: String = "",
+    // ── Word Drill ───────────────────────────────────────────────────────────
+    val drillWords: List<String> = emptyList(),    // struggled words to practice
+    val drillIndex: Int = 0,                        // current word index
+    val drillTip: String = "",                      // phonics tip from model
+    val drillSentence: String = "",                 // example sentence from model
+    val drillTriesLeft: Int = 3,                    // tries remaining for current word
+    val drillState: DrillState = DrillState.FETCHING_TIP,
 )
 
 @HiltViewModel
@@ -67,21 +91,6 @@ class LitBudViewModel @Inject constructor(
      * Writes to Room DB and SharedPreferences; never crashes on malformed JSON.
      */
     private val toolCallHandler by lazy { ToolCallHandler(context) }
-
-    /**
-     * System prompt loaded from assets once and reused for every coaching call.
-     * OCR and transcription calls do NOT use this — they have their own simple prompts.
-     */
-    private val coachingSystemInstruction: Contents? by lazy {
-        try {
-            val text = context.assets.open("prompts/tutor_system.txt")
-                .bufferedReader().use { it.readText() }
-            if (text.isNotEmpty()) Contents.of(Content.Text(text)) else null
-        } catch (e: Exception) {
-            Log.w(TAG, "Could not load tutor_system.txt: ${e.message}")
-            null
-        }
-    }
 
     // ─── Feature 1: Page Capture & OCR ───────────────────────────────────────
 
@@ -156,6 +165,13 @@ class LitBudViewModel @Inject constructor(
         viewModelScope.launch(Dispatchers.Default) {
             _uiState.update { it.copy(phase = LitBudPhase.COACHING) }
 
+            // Guard: very short audio means the mic didn't capture anything useful.
+            // 1000 bytes at 16kHz PCM-16 ≈ 31ms — clearly too short to be speech.
+            if (audioBytes.size < 1000) {
+                showError("I couldn't hear anything. Try reading a little louder!")
+                return@launch
+            }
+
             if (!waitForModel(model)) {
                 showError("The model isn't ready yet. Try again in a moment!")
                 return@launch
@@ -171,11 +187,19 @@ class LitBudViewModel @Inject constructor(
             // IMPORTANT: do NOT include the page text here. Including it causes Gemma to echo
             // the "correct" answer from context instead of transcribing the actual audio,
             // making every word appear correct even when the child misread.
+            // IMPORTANT: the prompt must strongly discourage sentence completion/hallucination.
+            // Gemma as an LLM naturally "fills in" plausible continuations even when the child
+            // stopped talking — this makes skipped and unread words appear green. Being
+            // explicit that stopping early is correct suppresses most of this behaviour.
             val transcribePrompt =
-                "Listen carefully to the audio recording. A child is reading aloud. " +
-                "Write out exactly what you hear them say, word by word. " +
-                "Return only the spoken words with no punctuation changes or corrections. " +
-                "Do not add any commentary."
+                "Transcribe only what is clearly spoken in this audio recording. A child is reading aloud.\n" +
+                "Rules you MUST follow:\n" +
+                "- Write only words you can actually hear, in the exact order they were spoken.\n" +
+                "- If the child stops talking, stop writing immediately. Do not continue.\n" +
+                "- Do NOT complete sentences. Do NOT add any words that were not spoken.\n" +
+                "- Do NOT guess or predict what comes next. Only transcribe what was said.\n" +
+                "- A short, accurate transcript is correct. A long, guessed transcript is wrong.\n" +
+                "Return only the spoken words with no punctuation changes or commentary."
 
             var transcription = ""
 
@@ -183,30 +207,38 @@ class LitBudViewModel @Inject constructor(
             val wavBytes = pcmToWav(audioBytes, sampleRate = 16000)
             Log.d(TAG, "Sending WAV to transcription: ${wavBytes.size} bytes")
 
-            model.runtimeHelper.runInference(
-                model = model,
-                input = transcribePrompt,
-                audioClips = listOf(wavBytes),
-                resultListener = { partial, done, _ ->
-                    transcription += partial
-                    if (done) {
-                        val spokenText = transcription.trim()
-                        Log.d(TAG, "Transcription result: '$spokenText'")
-                        Log.d(TAG, "Page text for comparison: '$pageText'")
-                        runFuzzyAndCoach(spokenText = spokenText, pageText = pageText, model = model)
-                    }
-                },
-                cleanUpListener = {
-                    if (_uiState.value.phase == LitBudPhase.COACHING) {
-                        showError("Oops, something went wrong while listening. Let's try again!")
-                    }
-                },
-                onError = { message ->
-                    Log.e(TAG, "Transcription error: $message")
-                    showError("I had trouble hearing that. Make sure the microphone is unblocked!")
-                },
-                coroutineScope = viewModelScope,
-            )
+            try {
+                model.runtimeHelper.runInference(
+                    model = model,
+                    input = transcribePrompt,
+                    audioClips = listOf(wavBytes),
+                    resultListener = { partial, done, _ ->
+                        transcription += partial
+                        if (done) {
+                            val spokenText = transcription.trim()
+                            Log.d(TAG, "Transcription result: '$spokenText'")
+                            Log.d(TAG, "Page text for comparison: '$pageText'")
+                            runFuzzyAndCoach(spokenText = spokenText, pageText = pageText, model = model)
+                        }
+                    },
+                    cleanUpListener = {
+                        if (_uiState.value.phase == LitBudPhase.COACHING) {
+                            showError("Oops, something went wrong while listening. Let's try again!")
+                        }
+                    },
+                    onError = { message ->
+                        Log.e(TAG, "Transcription error: $message")
+                        showError("I had trouble hearing that. Make sure the microphone is unblocked!")
+                    },
+                    coroutineScope = viewModelScope,
+                )
+            } catch (e: Exception) {
+                // LiteRtLmJniException from native miniaudio decoder bypasses the onError
+                // callback and propagates as a coroutine exception — catch it here so it
+                // never reaches the default crash handler.
+                Log.e(TAG, "Audio inference JNI exception: ${e.message}")
+                showError("I had trouble hearing that. Make sure the microphone is unblocked!")
+            }
         }
     }
 
@@ -215,15 +247,47 @@ class LitBudViewModel @Inject constructor(
             // Step 2: fuzzy matching (fully local, no model call)
             val pageWords = FuzzyMatcher.tokenize(pageText)
             val spokenWords = FuzzyMatcher.tokenize(spokenText)
-            val wordResults = FuzzyMatcher.compare(pageWords, spokenWords)
+            // Cap transcription length to page length. A child can only speak the words on
+            // the page — if the transcription is longer, the model hallucinated extra words.
+            // Without this cap, a hallucinated long transcription exhausts the matcher's
+            // NOT_REACHED path, making every unread word appear as MISSED (red) instead of
+            // NOT_REACHED (gray).
+            val spokenWordsCapped = spokenWords.take(pageWords.size)
+            val wordResults = FuzzyMatcher.compare(pageWords, spokenWordsCapped)
 
             Log.d(TAG, "FuzzyMatch — pageWords(${pageWords.size}): $pageWords")
-            Log.d(TAG, "FuzzyMatch — spokenWords(${spokenWords.size}): $spokenWords")
+            Log.d(TAG, "FuzzyMatch — spokenWords raw(${spokenWords.size}) capped(${spokenWordsCapped.size}): $spokenWordsCapped")
             wordResults.forEach { r ->
                 Log.d(TAG, "  '${r.expected}' vs '${r.spoken}' → score=${r.score} status=${r.status}")
             }
 
             _uiState.update { it.copy(wordResults = wordResults) }
+
+            // Write accuracy to DB immediately from fuzzy matching — ground truth.
+            // Only count words the child actually attempted (not NOT_REACHED).
+            // This replaces the model's track_progress tool call, which only guesses.
+            val attempted = wordResults.filter { it.status != WordStatus.NOT_REACHED }
+            val correctCount = attempted.count { it.status == WordStatus.CORRECT }
+            val accuracyPct = if (attempted.isEmpty()) 100f
+                              else correctCount.toFloat() / attempted.size * 100f
+            val struggledJson = JSONArray(
+                FuzzyMatcher.needsHelp(wordResults).map { it.expected }
+            ).toString()
+            viewModelScope.launch(Dispatchers.IO) {
+                try {
+                    LitBudDatabase.getInstance(context).progressDao().insert(
+                        ProgressEntity(
+                            timestamp = System.currentTimeMillis(),
+                            accuracyPercent = accuracyPct,
+                            wordsPerMinute = 0f,
+                            struggledWords = struggledJson,
+                        )
+                    )
+                    Log.d(TAG, "Progress saved: accuracy=%.0f%% attempted=${attempted.size}".format(accuracyPct))
+                } catch (e: Exception) {
+                    Log.e(TAG, "Progress DB write failed: ${e.message}")
+                }
+            }
 
             // Step 3: coaching prompt uses only the struggling/missed words
             val needsHelp = FuzzyMatcher.needsHelp(wordResults)
@@ -236,11 +300,15 @@ class LitBudViewModel @Inject constructor(
             }
             val coachingPrompt = COACHING_PROMPT_TEMPLATE.format(pageText, wordAnalysis)
 
+            // Do NOT pass systemInstruction here. The engine was already initialised with
+            // tutor_system.txt in LitBudTask.initializeModelFn. Passing it again via
+            // ConversationConfig causes engine.createConversation() to fail silently inside
+            // the Gallery's try-catch, leaving instance.conversation as the just-closed old
+            // conversation — then runInference immediately hits checkIsAlive and crashes.
             model.runtimeHelper.resetConversation(
                 model = model,
                 supportImage = false,
                 supportAudio = false,
-                systemInstruction = coachingSystemInstruction,
             )
 
             var coachingResponse = ""
@@ -274,6 +342,226 @@ class LitBudViewModel @Inject constructor(
                 coroutineScope = viewModelScope,
             )
         }
+    }
+
+    // ─── Feature 6: Word Drill ────────────────────────────────────────────────
+
+    /**
+     * Starts a word-by-word practice drill for all struggled/missed words from the
+     * current session. Called when the child taps "Practice Missed Words" on the
+     * Result screen.
+     */
+    fun startDrill(model: Model) {
+        val words = FuzzyMatcher.needsHelp(_uiState.value.wordResults).map { it.expected }
+        if (words.isEmpty()) return
+        _uiState.update {
+            it.copy(
+                phase = LitBudPhase.WORD_DRILL,
+                drillWords = words,
+                drillIndex = 0,
+                drillTriesLeft = 3,
+                drillState = DrillState.FETCHING_TIP,
+            )
+        }
+        fetchDrillTip(words[0], model)
+    }
+
+    /**
+     * Fetches a phonics tip and example sentence for [word] using a lightweight
+     * text-only model call. Falls back to a letter-by-letter tip if parsing fails.
+     */
+    private fun fetchDrillTip(word: String, model: Model) {
+        viewModelScope.launch(Dispatchers.Default) {
+            if (!waitForModel(model)) {
+                _uiState.update {
+                    it.copy(
+                        drillTip = "Say each letter: ${word.uppercase()}",
+                        drillSentence = "",
+                        drillState = DrillState.SHOWING_WORD,
+                    )
+                }
+                return@launch
+            }
+
+            val langInstruction = detectLanguageInstruction(_uiState.value.ocrText)
+            val tipPrompt = buildString {
+                append("Give a one-sentence phonics tip for the word \"$word\" for a young child aged 5-8.")
+                append("\nThen give one very short example sentence (5-8 words) using that word.")
+                if (langInstruction.isNotEmpty()) append("\n$langInstruction")
+                append("\nRespond ONLY in this exact format (no extra text):\nTIP: <tip here>\nSENTENCE: <sentence here>")
+            }
+
+            model.runtimeHelper.resetConversation(
+                model = model,
+                supportImage = false,
+                supportAudio = false,
+            )
+
+            var tipResponse = ""
+            model.runtimeHelper.runInference(
+                model = model,
+                input = tipPrompt,
+                resultListener = { partial, done, _ ->
+                    tipResponse += partial
+                    if (done) {
+                        val tip = extractLine(tipResponse, "TIP:")
+                        val sentence = extractLine(tipResponse, "SENTENCE:")
+                        Log.d(TAG, "Drill tip for '$word': tip='$tip' sentence='$sentence'")
+                        _uiState.update {
+                            it.copy(
+                                drillTip = tip.ifEmpty { "Say each letter: ${word.uppercase()}" },
+                                drillSentence = sentence,
+                                drillState = DrillState.SHOWING_WORD,
+                            )
+                        }
+                    }
+                },
+                cleanUpListener = {
+                    if (_uiState.value.drillState == DrillState.FETCHING_TIP) {
+                        _uiState.update {
+                            it.copy(
+                                drillTip = "Say each letter: ${word.uppercase()}",
+                                drillSentence = "",
+                                drillState = DrillState.SHOWING_WORD,
+                            )
+                        }
+                    }
+                },
+                onError = { message ->
+                    Log.e(TAG, "Drill tip error: $message")
+                    _uiState.update {
+                        it.copy(
+                            drillTip = "Say each letter: ${word.uppercase()}",
+                            drillSentence = "",
+                            drillState = DrillState.SHOWING_WORD,
+                        )
+                    }
+                },
+                coroutineScope = viewModelScope,
+            )
+        }
+    }
+
+    /**
+     * Evaluates whether the child said the current drill word correctly.
+     * [audioBytes] is raw PCM-16 at 16kHz — converted to WAV before sending to the model.
+     *
+     * Uses transcription + FuzzyMatcher (same as main reading flow) instead of asking the
+     * model CORRECT/WRONG. Model-based judgment always defaults to "CORRECT" when uncertain
+     * because Gemma as an LLM is encouraging by nature — it would pass "stupid" for "difference".
+     * Transcribing first and scoring with FuzzyMatcher gives an objective similarity score.
+     */
+    fun recordAndEvaluateDrillWord(audioBytes: ByteArray, model: Model) {
+        val currentWord = _uiState.value.drillWords.getOrNull(_uiState.value.drillIndex) ?: return
+        _uiState.update { it.copy(drillState = DrillState.EVALUATING) }
+
+        viewModelScope.launch(Dispatchers.Default) {
+            if (audioBytes.size < 500) {
+                val tries = _uiState.value.drillTriesLeft
+                _uiState.update {
+                    it.copy(
+                        drillTriesLeft = if (tries > 1) tries - 1 else 1,
+                        drillState = DrillState.SHOWING_WORD,
+                    )
+                }
+                return@launch
+            }
+
+            if (!waitForModel(model)) {
+                _uiState.update { it.copy(drillState = DrillState.SHOWING_WORD) }
+                return@launch
+            }
+
+            val wavBytes = pcmToWav(audioBytes, sampleRate = 16000)
+            val transcribePrompt =
+                "Transcribe only what is clearly spoken in this short audio clip. " +
+                "Write only the word(s) you can actually hear — do not guess or complete. " +
+                "Return only the spoken word(s) with no commentary."
+
+            model.runtimeHelper.resetConversation(
+                model = model,
+                supportImage = false,
+                supportAudio = true,
+            )
+
+            var transcription = ""
+            try {
+                model.runtimeHelper.runInference(
+                    model = model,
+                    input = transcribePrompt,
+                    audioClips = listOf(wavBytes),
+                    resultListener = { partial, done, _ ->
+                        transcription += partial
+                        if (done) {
+                            val spokenText = transcription.trim()
+                            val spokenWords = FuzzyMatcher.tokenize(spokenText)
+                            // Accept if ANY spoken word scores ≥ THRESHOLD_CORRECT against target
+                            val bestScore = spokenWords.maxOfOrNull { spoken ->
+                                FuzzyMatcher.similarity(
+                                    FuzzyMatcher.normalize(currentWord),
+                                    FuzzyMatcher.normalize(spoken),
+                                )
+                            } ?: 0
+                            Log.d(TAG, "Drill eval '$currentWord': spoken=$spokenWords bestScore=$bestScore")
+                            if (bestScore >= THRESHOLD_CORRECT) {
+                                _uiState.update { it.copy(drillState = DrillState.WORD_CORRECT) }
+                            } else {
+                                val tries = _uiState.value.drillTriesLeft
+                                if (tries > 1) {
+                                    _uiState.update {
+                                        it.copy(
+                                            drillTriesLeft = tries - 1,
+                                            drillState = DrillState.SHOWING_WORD,
+                                        )
+                                    }
+                                } else {
+                                    _uiState.update { it.copy(drillState = DrillState.WORD_FAILED) }
+                                }
+                            }
+                        }
+                    },
+                    cleanUpListener = {
+                        if (_uiState.value.drillState == DrillState.EVALUATING) {
+                            _uiState.update { it.copy(drillState = DrillState.SHOWING_WORD) }
+                        }
+                    },
+                    onError = { message ->
+                        Log.e(TAG, "Drill transcription error: $message")
+                        _uiState.update { it.copy(drillState = DrillState.SHOWING_WORD) }
+                    },
+                    coroutineScope = viewModelScope,
+                )
+            } catch (e: Exception) {
+                Log.e(TAG, "Drill transcription JNI exception: ${e.message}")
+                _uiState.update { it.copy(drillState = DrillState.SHOWING_WORD) }
+            }
+        }
+    }
+
+    /**
+     * Advances to the next drill word, or transitions to COMPLETE if all words are done.
+     */
+    fun advanceDrill(model: Model) {
+        val nextIndex = _uiState.value.drillIndex + 1
+        if (nextIndex < _uiState.value.drillWords.size) {
+            _uiState.update {
+                it.copy(
+                    drillIndex = nextIndex,
+                    drillTriesLeft = 3,
+                    drillTip = "",
+                    drillSentence = "",
+                    drillState = DrillState.FETCHING_TIP,
+                )
+            }
+            fetchDrillTip(_uiState.value.drillWords[nextIndex], model)
+        } else {
+            _uiState.update { it.copy(drillState = DrillState.COMPLETE) }
+        }
+    }
+
+    /** Finishes the drill and returns to the capture screen for a new page. */
+    fun finishDrill() {
+        _uiState.update { LitBudUiState() }
     }
 
     // ─── Navigation ───────────────────────────────────────────────────────────
@@ -337,6 +625,26 @@ class LitBudViewModel @Inject constructor(
             }
         }
         return text.trim()
+    }
+
+    /** Parses a "PREFIX: value" line out of a multi-line model response. */
+    private fun extractLine(text: String, prefix: String): String {
+        val line = text.lines().firstOrNull { it.trim().startsWith(prefix) } ?: return ""
+        return line.substringAfter(prefix).trim()
+    }
+
+    /**
+     * Detects the language of the session from the OCR text script and returns
+     * a language instruction line to include in drill prompts.
+     */
+    private fun detectLanguageInstruction(ocrText: String): String {
+        val hasDevanagari = ocrText.any { it.code in 0x0900..0x097F }
+        val hasTamil = ocrText.any { it.code in 0x0B80..0x0BFF }
+        return when {
+            hasDevanagari -> "IMPORTANT: Respond entirely in Hindi."
+            hasTamil -> "IMPORTANT: Respond entirely in Tamil."
+            else -> ""
+        }
     }
 
     private suspend fun waitForModel(model: Model): Boolean {

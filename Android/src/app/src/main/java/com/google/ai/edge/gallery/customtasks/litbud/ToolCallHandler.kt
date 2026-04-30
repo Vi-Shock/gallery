@@ -59,7 +59,9 @@ class ToolCallHandler(private val context: Context) {
                 val name = call.optString("name")
                 val args = call.optJSONObject("arguments") ?: JSONObject()
                 when (name) {
-                    "track_progress"    -> handleTrackProgress(args, coroutineScope)
+                    // track_progress accuracy is written directly from FuzzyMatcher in
+                    // LitBudViewModel — the model's guess is unreliable. Ignore here.
+                    "track_progress"    -> Unit
                     "log_session"       -> handleLogSession(args, coroutineScope)
                     "get_hint"          -> hintText = args.optString("hint").takeIf { it.isNotEmpty() }
                     "adjust_difficulty" -> handleAdjustDifficulty(args)
